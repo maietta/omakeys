@@ -866,15 +866,21 @@ fn spawn_cell_scan(
     grid_windows: Vec<GridRegionWindow>,
     coarse: char,
 ) {
-    let Some(region) = ({
-        let s = state.borrow();
-        grid::coarse_region_bounds(&s.cells, coarse)
-    }) else {
-        return;
-    };
-    let (region_x, region_y, region_w, region_h) = region;
-
     glib::spawn_future_local(async move {
+        // Deliberately borrowed here, not before `spawn_future_local` -- this function is
+        // called from `handle_key`'s `Mode::TypingCoarse` branch while it's still holding its
+        // own `state.borrow_mut()`, so borrowing synchronously here would conflict with that
+        // and panic (confirmed live: "RefCell already mutably borrowed", non-unwinding, took
+        // the whole daemon down). Everything in this async block only ever runs on a later
+        // main-loop iteration, well after `handle_key` has returned and dropped its own
+        // borrow, so there's nothing to wait for here -- `cells` doesn't change again until
+        // the next `show()` anyway.
+        let Some((region_x, region_y, region_w, region_h)) =
+            ({ grid::coarse_region_bounds(&state.borrow().cells, coarse) })
+        else {
+            return;
+        };
+
         let windows = match active_monitor::focused_monitor_windows() {
             Ok(windows) => windows,
             Err(e) => {
