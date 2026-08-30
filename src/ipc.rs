@@ -15,8 +15,6 @@ pub enum Command {
     ToggleGrid,
     /// Scan AT-SPI for buttons/text-fields/scrollables/terminals and visualize them.
     ToggleHints,
-    /// Super was held past the long-press threshold: open the settings/cheat-sheet menu.
-    ToggleMenu,
     /// Cleanly stop the daemon.
     Quit,
 }

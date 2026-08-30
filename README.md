@@ -93,9 +93,12 @@ a pure opportunistic upgrade for whenever you pause even briefly after a coarse 
 
 ### Settings menu
 
-Hold Super for 3+ seconds to open a small settings/cheat-sheet overlay. `+`/`-` adjust the
-nudge step (how far each `h`/`j`/`k`/`l` press moves the cursor), saved to
-`~/.config/omakeys/config.json`.
+Hold Super for 3+ seconds to open the settings/cheat-sheet menu — a terminal UI, launched in
+your default terminal (`omarchy-launch-terminal`, so whatever's actually configured on your
+system). `+`/`-` adjust the nudge step (how far each `h`/`j`/`k`/`l` press moves the cursor),
+saved live to `~/.config/omakeys/config.json`. `Esc`/`q` to close. Run `omakeys menu` yourself
+any time to open it outside the long-press, or `omakeys settings-tui` to run it directly in
+your current terminal instead of a new window.
 
 ## How it works
 

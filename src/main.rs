@@ -10,12 +10,13 @@ mod ipc;
 mod overlay;
 mod pointer;
 mod screencap;
+mod settings_tui;
 mod vision;
 
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use gtk4::prelude::*;
 
@@ -43,11 +44,16 @@ enum Commands {
     /// Tell a running daemon to toggle the AT-SPI button/text-field/scrollable/terminal
     /// hint visualization.
     Hints,
-    /// Tell a running daemon to toggle the settings/cheat-sheet menu. Bind this to a genuine
-    /// long-press (3s+) of Super -- see the Hyprland press/release timer-script pair in
-    /// bindings.lua, not Hyprland's own `long_press` flag (confirmed not to discriminate
-    /// hold duration at all -- see HANDOFF.md).
+    /// Open the settings/cheat-sheet menu as a terminal UI (via `omarchy-launch-terminal`,
+    /// respecting the user's default terminal). Bind this to a genuine long-press (3s+) of
+    /// Super -- see the Hyprland press/release timer-script pair in bindings.lua, not
+    /// Hyprland's own `long_press` flag (confirmed not to discriminate hold duration at all --
+    /// see HANDOFF.md). Standalone -- doesn't need the daemon running.
     Menu,
+    /// Run the settings TUI directly in the current terminal, blocking until Esc/q. This is
+    /// what `Menu` launches in a new terminal window; run it yourself if you're already in a
+    /// terminal and don't want a new window.
+    SettingsTui,
     /// Tell a running daemon to shut down.
     Quit,
     /// Dev/debug tool: render an animated GIF of the experimental seed-growth vision
@@ -120,6 +126,23 @@ enum Commands {
         #[arg(long, value_enum)]
         check: Option<fullscan_viz::CheckKind>,
     },
+    /// Dev/debug tool: warp the *real* cursor to (x, y) on the focused monitor via the same
+    /// virtual-pointer protocol the daemon itself uses. Not needed for normal use -- exists
+    /// to pin the real cursor over a specific window before scripting synthetic keyboard
+    /// input (e.g. wtype) into the overlay: Hyprland's `input:follow_mouse` (left at its
+    /// default -- changing it globally just to help scripted testing isn't the right
+    /// trade-off) continuously refocuses keyboard input to whatever's under the real cursor,
+    /// which can silently steal the overlay's keyboard grab away mid-script if the cursor is
+    /// left sitting wherever it last happened to be (e.g. over the terminal driving the
+    /// script) instead of over the window actually being driven.
+    MoveCursor {
+        /// X position in the focused monitor's own logical pixels.
+        #[arg(long)]
+        x: f64,
+        /// Y position in the focused monitor's own logical pixels.
+        #[arg(long)]
+        y: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -130,7 +153,8 @@ fn main() -> Result<()> {
         Commands::Daemon => run_daemon(),
         Commands::Toggle => ipc::send_command(ipc::Command::ToggleGrid),
         Commands::Hints => ipc::send_command(ipc::Command::ToggleHints),
-        Commands::Menu => ipc::send_command(ipc::Command::ToggleMenu),
+        Commands::Menu => run_menu(),
+        Commands::SettingsTui => settings_tui::run(),
         Commands::Quit => ipc::send_command(ipc::Command::Quit),
         Commands::VisualizeGrowth { out, width, height, x, y } => {
             let (capture, window) = capture_crop(width, height, x, y)?;
@@ -158,7 +182,27 @@ fn main() -> Result<()> {
             println!("wrote {}", out_path.display());
             Ok(())
         }
+        Commands::MoveCursor { x, y } => {
+            let (output_name, screen_w, screen_h) = active_monitor::focused_output_geometry()?;
+            let mut ptr = pointer::VirtualPointer::new(Some(&output_name))?;
+            ptr.move_to(x, y, screen_w, screen_h)?;
+            Ok(())
+        }
     }
+}
+
+/// Open the settings TUI in a new terminal window, respecting the user's configured default
+/// terminal (`omarchy-launch-terminal`, an Omarchy wrapper around `xdg-terminal-exec`) rather
+/// than hardcoding one. Spawns and returns immediately -- the terminal (and the `settings-tui`
+/// process running inside it) outlives this short-lived CLI invocation.
+fn run_menu() -> Result<()> {
+    let exe = std::env::current_exe().context("finding omakeys' own executable path")?;
+    std::process::Command::new("omarchy-launch-terminal")
+        .arg(exe)
+        .arg("settings-tui")
+        .spawn()
+        .context("launching omarchy-launch-terminal (is Omarchy installed?)")?;
+    Ok(())
 }
 
 /// A 400x300 grayscale buffer with a wide "broad band" of alternating columns (x=60..180 --
@@ -230,7 +274,6 @@ fn run_daemon() -> Result<()> {
                 match cmd {
                     ipc::Command::ToggleGrid => overlay.toggle(),
                     ipc::Command::ToggleHints => overlay.toggle_hints(),
-                    ipc::Command::ToggleMenu => overlay.toggle_menu(),
                     ipc::Command::Quit => {
                         app_for_quit.quit();
                         break;

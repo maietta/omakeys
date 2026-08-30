@@ -1,6 +1,6 @@
-//! Persistent, user-adjustable settings, changed from the settings menu (`Mode::Menu` in
-//! overlay.rs, opened by holding Super) and stored as JSON under the XDG config directory so
-//! they survive daemon restarts.
+//! Persistent, user-adjustable settings, changed from the settings TUI (`settings_tui.rs`,
+//! opened by holding Super) and stored as JSON under the XDG config directory so they survive
+//! daemon restarts.
 
 use std::path::PathBuf;
 

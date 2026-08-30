@@ -11,7 +11,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::active_monitor;
 use crate::atspi_scan;
-use crate::config::{self, Settings, NUDGE_STEP_INCREMENT, NUDGE_STEP_MAX, NUDGE_STEP_MIN};
+use crate::config::{self, Settings};
 use crate::grid::{self, Cell};
 use crate::hints::{self, HintTarget};
 use crate::pointer::{VirtualPointer, BTN_LEFT, BTN_RIGHT};
@@ -48,9 +48,6 @@ enum Mode {
     /// coarse-region-scoped scan (`spawn_cell_scan`, just the buttons found within one
     /// picked coarse cell) -- the labeling/matching logic doesn't need to know or care which.
     Hints { targets: Vec<HintTarget>, typed: String },
-    /// The settings/cheat-sheet menu, opened by holding Super past the long-press threshold
-    /// (see `toggle_menu()`). `+`/`-` adjust `Settings::nudge_step` live; Escape closes.
-    Menu,
 }
 
 struct State {
@@ -60,8 +57,9 @@ struct State {
     screen_h: f64,
     /// Connected only while the overlay is open (bound to the focused output).
     pointer: Option<VirtualPointer>,
-    /// User-adjustable settings (currently just nudge step), loaded once at daemon startup
-    /// and persisted to disk (`config::save`) whenever the menu changes one.
+    /// User-adjustable settings (currently just nudge step), loaded once at daemon startup.
+    /// Changed and persisted via the settings TUI (`settings_tui.rs`, a separate process), not
+    /// from here -- this is a read-only snapshot as far as the overlay is concerned.
     settings: Settings,
     /// Advances continuously (see the tick timer in `Overlay::new()`) to animate a "marching
     /// ants" effect along vision-detected target outlines -- see `DASH_PHASE_STEP`.
@@ -421,25 +419,6 @@ impl Overlay {
         });
     }
 
-    /// Toggle the settings/cheat-sheet menu (opened by a genuine Super long-press -- see
-    /// `ipc::Command::ToggleMenu`'s doc comment). No pointer needed, unlike the other modes:
-    /// the menu doesn't move the cursor or click anything.
-    pub fn toggle_menu(&self) {
-        let currently_hidden = matches!(self.state.borrow().mode, Mode::Hidden);
-        if !currently_hidden {
-            self.hide();
-            return;
-        }
-
-        let _ = self.present_on_focused_monitor();
-        self.window.set_keyboard_mode(KeyboardMode::OnDemand);
-
-        let mut state = self.state.borrow_mut();
-        state.mode = Mode::Menu;
-        drop(state);
-        self.drawing_area.queue_draw();
-    }
-
     /// Resolve the focused monitor, pin the layer surface to it, and present the window.
     /// Returns the output's connector name (if resolved), the resolved `gdk4::Monitor` itself
     /// (so callers that need to pin *other* windows to the same monitor -- see
@@ -723,21 +702,6 @@ fn handle_key(
                 s.mode = Mode::Selected { x: new_pos.0, y: new_pos.1, holding: new_holding };
             }
         }
-
-        Mode::Menu => {
-            let delta = match keyval {
-                gdk4::Key::plus | gdk4::Key::equal | gdk4::Key::KP_Add => NUDGE_STEP_INCREMENT,
-                gdk4::Key::minus | gdk4::Key::KP_Subtract => -NUDGE_STEP_INCREMENT,
-                _ => 0.0,
-            };
-            if delta != 0.0 {
-                s.settings.nudge_step =
-                    (s.settings.nudge_step + delta).clamp(NUDGE_STEP_MIN, NUDGE_STEP_MAX);
-                if let Err(e) = config::save(&s.settings) {
-                    log::warn!("omakeys: failed to save settings: {e}");
-                }
-            }
-        }
     }
 
     drop(s);
@@ -938,6 +902,16 @@ fn spawn_cell_scan(
                 let targets = hints::assign_labels(buttons, Vec::new());
                 state.borrow_mut().mode = Mode::Hints { targets, typed: String::new() };
                 hide_grid_windows(&grid_windows);
+                // Re-assert the keyboard grab after hiding the 15 grid-region windows --
+                // confirmed live: without this, further keystrokes stopped reaching the
+                // overlay at all (even Escape) the moment this branch ran, specifically
+                // when reached via this async completion rather than a synchronous
+                // handle_key transition. Hiding several overlay-layer surfaces at once
+                // appears to make Hyprland recompute keyboard focus, which can land
+                // somewhere other than our still-open main window; explicitly re-requesting
+                // OnDemand here (same pattern `click_through` already uses after a
+                // hide/show pair) reclaims it rather than leaving it to chance.
+                window.set_keyboard_mode(KeyboardMode::OnDemand);
                 drawing_area.queue_draw();
             }
         }
@@ -971,12 +945,6 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
                 draw_hints(cr, targets, typed, width, height, state.dash_phase);
             }
         }
-
-        Mode::Menu => {
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.75);
-            let _ = cr.paint();
-            draw_menu(cr, width, height, state.settings.nudge_step);
-        }
     }
 }
 
@@ -996,95 +964,6 @@ fn draw_no_hints_message(cr: &cairo::Context, width: f64, _height: f64) {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
         draw_centered_text(cr, text, width / 2.0, box_y + box_h / 2.0);
     }
-}
-
-/// Keybind reference shown in the settings menu, as (key, description) pairs.
-const CHEAT_SHEET: &[(&str, &str)] = &[
-    ("Right Shift / Super (tap)", "Open grid mode"),
-    ("Control_R", "Open hint mode (AT-SPI/vision element hints)"),
-    ("Super (hold)", "Open this menu"),
-    ("<coarse><fine>", "Grid: pick a cell by its two-key code"),
-    ("h j k l / arrows", "Nudge the cursor"),
-    ("Space", "Click"),
-    ("Shift + Space", "Right-click"),
-    ("Left Shift (hold)", "Click-and-drag: hold, nudge to select, release to finish"),
-    ("<label>", "Hints: type a target's label to warp + click it"),
-    ("Backspace", "Undo the last typed character"),
-    ("Escape", "Close the overlay"),
-];
-
-fn draw_menu(cr: &cairo::Context, width: f64, height: f64, nudge_step: f64) {
-    let title = "omakeys";
-    let row_h = 26.0;
-    let padding = 24.0;
-    let title_h = 40.0;
-    let setting_h = 34.0;
-    let footer_h = 30.0;
-
-    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-    cr.set_font_size(13.0);
-    let key_col_w = CHEAT_SHEET
-        .iter()
-        .filter_map(|(key, _)| cr.text_extents(key).ok().map(|e| e.width()))
-        .fold(0.0_f64, f64::max);
-
-    let box_w = 620.0_f64.min(width - 80.0);
-    let box_h = title_h + row_h * CHEAT_SHEET.len() as f64 + setting_h + footer_h + padding * 2.0;
-    let box_x = (width - box_w) / 2.0;
-    let box_y = ((height - box_h) / 2.0).max(20.0);
-
-    rounded_rect(cr, box_x, box_y, box_w, box_h, 10.0);
-    cr.set_source_rgba(0.07, 0.07, 0.09, 0.97);
-    let _ = cr.fill_preserve();
-    cr.set_source_rgba(0.4, 0.7, 1.0, 0.6);
-    let _ = cr.set_line_width(1.5);
-    let _ = cr.stroke();
-
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-    cr.set_font_size(20.0);
-    draw_centered_text(cr, title, width / 2.0, box_y + title_h / 2.0 + padding / 2.0);
-
-    let key_x = box_x + padding;
-    let desc_x = box_x + padding + key_col_w + 24.0;
-    let mut row_y = box_y + title_h + padding;
-
-    cr.set_font_size(13.0);
-    for &(key, desc) in CHEAT_SHEET {
-        cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-        cr.set_source_rgba(0.4, 0.85, 1.0, 0.95);
-        cr.move_to(key_x, row_y);
-        let _ = cr.show_text(key);
-
-        cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-        cr.set_source_rgba(0.9, 0.9, 0.9, 0.95);
-        cr.move_to(desc_x, row_y);
-        let _ = cr.show_text(desc);
-
-        row_y += row_h;
-    }
-
-    // The one live-adjustable setting -- visually separated from the static reference above.
-    row_y += 6.0;
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
-    cr.move_to(box_x + padding, row_y - 14.0);
-    cr.line_to(box_x + box_w - padding, row_y - 14.0);
-    let _ = cr.stroke();
-
-    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-    cr.set_source_rgba(1.0, 0.85, 0.2, 1.0);
-    cr.move_to(key_x, row_y);
-    let _ = cr.show_text("+ / -");
-
-    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    cr.set_source_rgba(0.9, 0.9, 0.9, 0.95);
-    cr.move_to(desc_x, row_y);
-    let _ = cr.show_text(&format!("Nudge speed: {nudge_step:.0}px per press"));
-
-    cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    cr.set_source_rgba(0.6, 0.6, 0.6, 0.9);
-    cr.set_font_size(12.0);
-    draw_centered_text(cr, "Esc to close", width / 2.0, box_y + box_h - footer_h / 2.0);
 }
 
 /// Draw an outline + callout bubble over each hint target. Targets whose label no longer

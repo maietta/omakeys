@@ -11,6 +11,9 @@ struct HyprMonitor {
     focused: bool,
     x: f64,
     y: f64,
+    width: f64,
+    height: f64,
+    scale: f64,
     #[serde(rename = "activeWorkspace")]
     active_workspace: HyprWorkspaceRef,
 }
@@ -32,6 +35,23 @@ pub fn focused_output_name() -> Result<String> {
         .into_iter()
         .find(|m| m.focused)
         .map(|m| m.name)
+        .context("no focused monitor reported by hyprctl")
+}
+
+/// The focused monitor's connector name plus its logical size (`width`/`height` divided by
+/// `scale`, matching the logical-pixel space `pointer::VirtualPointer::move_to` and the
+/// overlay itself both operate in).
+pub fn focused_output_geometry() -> Result<(String, f64, f64)> {
+    let output = std::process::Command::new("hyprctl")
+        .args(["-j", "monitors"])
+        .output()
+        .context("running `hyprctl -j monitors`")?;
+    let monitors: Vec<HyprMonitor> =
+        serde_json::from_slice(&output.stdout).context("parsing `hyprctl -j monitors` output")?;
+    monitors
+        .into_iter()
+        .find(|m| m.focused)
+        .map(|m| (m.name, m.width / m.scale, m.height / m.scale))
         .context("no focused monitor reported by hyprctl")
 }
 

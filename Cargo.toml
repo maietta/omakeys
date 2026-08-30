@@ -46,3 +46,7 @@ log = "0.4"
 env_logger = "0.11"
 directories = "5"
 gdk4-wayland = { version = "0.9", features = ["wayland-client", "wayland_crate"] }
+
+# Settings/cheat-sheet TUI (launched in a real terminal on Super-hold -- see settings_tui.rs)
+ratatui = "0.29"
+crossterm = "0.28"
