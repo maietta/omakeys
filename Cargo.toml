@@ -1,0 +1,48 @@
+[package]
+name = "omg-keys"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard-driven mouse replacement: grid overlay + AT-SPI button/text-field hints, for Hyprland/wlroots."
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Overlay UI
+gtk4 = "0.9"
+gtk4-layer-shell = "0.4"
+cairo-rs = "0.20"
+gdk4 = "0.9"
+glib = "0.20"
+
+# Virtual pointer input on Wayland (wlr-virtual-pointer)
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+# AT-SPI accessibility tree scanning (default async-io backend, driven fine by
+# glib's local executor via spawn_future_local -- no tokio runtime needed)
+atspi = "0.24"
+zbus = "4"
+zvariant = "4"
+futures-lite = "2"
+
+# cross-thread -> glib-main-loop handoff for IPC commands
+async-channel = "2"
+
+# Vision-based hint fallback: screenshot capture (wlr-screencopy) + classical rectangle
+# detection, for apps AT-SPI can't see into (GTK4 position bug, Electron without a11y).
+rustix = { version = "1", features = ["fs"] }
+memmap2 = "0.9"
+image = { version = "0.25", default-features = false }
+imageproc = "0.27"
+
+# IPC + misc
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+directories = "5"
+gdk4-wayland = { version = "0.9", features = ["wayland-client", "wayland_crate"] }
