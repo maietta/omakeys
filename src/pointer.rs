@@ -126,14 +126,14 @@ impl VirtualPointer {
         let manager: ZwlrVirtualPointerManagerV1 = globals.bind(&qh, 1..=2, ()).map_err(|e| {
             anyhow!(
                 "compositor does not support zwlr_virtual_pointer_manager_v1 \
-                 (needed to move the mouse from omg-keys): {e}"
+                 (needed to move the mouse from omakeys): {e}"
             )
         })?;
 
         let target_output = output_name.and_then(|name| state.outputs_by_name.get(name));
         if output_name.is_some() && target_output.is_none() {
             log::warn!(
-                "omg-keys: requested output {output_name:?} not found, falling back to \
+                "omakeys: requested output {output_name:?} not found, falling back to \
                  global (multi-monitor) pointer coordinates"
             );
         }

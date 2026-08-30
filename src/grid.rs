@@ -115,11 +115,11 @@ pub fn cells_in_region<'a>(cells: &'a [Cell], coarse: char) -> Vec<&'a Cell> {
     cells.iter().filter(|c| c.label[0] == coarse).collect()
 }
 
-/// The center of a whole coarse region (the bounding box of all 15 sub-cells within it) --
-/// used to start nudging immediately from a coarse pick alone, without requiring a second,
-/// separate fine-key press first (h/j/k/l are reserved for movement, not fine-picking -- see
-/// `overlay.rs`'s `Mode::TypingFine` handler).
-pub fn coarse_region_center(cells: &[Cell], coarse: char) -> Option<(f64, f64)> {
+/// The bounding box of a whole coarse region (the union of all 15 sub-cells within it), as
+/// `(x, y, w, h)` -- used both to nudge immediately from a coarse pick alone (see
+/// `coarse_region_center`) and to scope an AT-SPI element scan to just that region (see
+/// `overlay.rs`'s `spawn_cell_scan`).
+pub fn coarse_region_bounds(cells: &[Cell], coarse: char) -> Option<(f64, f64, f64, f64)> {
     let region = cells_in_region(cells, coarse);
     if region.is_empty() {
         return None;
@@ -128,7 +128,15 @@ pub fn coarse_region_center(cells: &[Cell], coarse: char) -> Option<(f64, f64)> 
     let min_y = region.iter().map(|c| c.y).fold(f64::MAX, f64::min);
     let max_x = region.iter().map(|c| c.x + c.w).fold(f64::MIN, f64::max);
     let max_y = region.iter().map(|c| c.y + c.h).fold(f64::MIN, f64::max);
-    Some(((min_x + max_x) / 2.0, (min_y + max_y) / 2.0))
+    Some((min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+/// The center of a whole coarse region -- used to start nudging immediately from a coarse
+/// pick alone, without requiring a second, separate fine-key press first (h/j/k/l are
+/// reserved for movement, not fine-picking -- see `overlay.rs`'s `Mode::TypingFine` handler).
+pub fn coarse_region_center(cells: &[Cell], coarse: char) -> Option<(f64, f64)> {
+    let (x, y, w, h) = coarse_region_bounds(cells, coarse)?;
+    Some((x + w / 2.0, y + h / 2.0))
 }
 
 #[cfg(test)]
@@ -165,6 +173,26 @@ mod tests {
         let max_y = cells.iter().map(|c| c.y + c.h).fold(f64::MIN, f64::max);
         assert!((max_x - 1920.0).abs() < 1e-6);
         assert!((max_y - 1080.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn coarse_region_bounds_matches_a_regions_own_span() {
+        let cells = build_grid(1920.0, 1080.0);
+        let (x, y, w, h) = coarse_region_bounds(&cells, 'a').unwrap();
+        let region = cells_in_region(&cells, 'a');
+        let min_x = region.iter().map(|c| c.x).fold(f64::MAX, f64::min);
+        let min_y = region.iter().map(|c| c.y).fold(f64::MAX, f64::min);
+        let max_x = region.iter().map(|c| c.x + c.w).fold(f64::MIN, f64::max);
+        let max_y = region.iter().map(|c| c.y + c.h).fold(f64::MIN, f64::max);
+        assert_eq!((x, y), (min_x, min_y));
+        assert_eq!((x + w, y + h), (max_x, max_y));
+    }
+
+    #[test]
+    fn coarse_region_center_matches_bounds_midpoint() {
+        let cells = build_grid(1920.0, 1080.0);
+        let (x, y, w, h) = coarse_region_bounds(&cells, 'g').unwrap();
+        assert_eq!(coarse_region_center(&cells, 'g'), Some((x + w / 2.0, y + h / 2.0)));
     }
 }
 

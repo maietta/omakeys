@@ -41,9 +41,12 @@ enum Mode {
     /// button, arrow/hjkl movement while held drags (a real button-down click followed by
     /// motion is what any app interprets as a drag/selection), and Shift up releases it.
     Selected { x: f64, y: f64, holding: bool },
-    /// Showing color-coded, keystroke-labeled boxes over buttons/text-fields/scrollables/
-    /// terminals found via AT-SPI in windows on the focused monitor. `typed` accumulates
-    /// label characters as they're typed, narrowing down to one target.
+    /// Showing color-coded, keystroke-labeled boxes over targets found via AT-SPI. `typed`
+    /// accumulates label characters as they're typed, narrowing down to one target. Reused
+    /// for two different origins: whole-screen hint mode (`toggle_hints`, every
+    /// button/text-field/scrollable/terminal in windows on the focused monitor) and a
+    /// coarse-region-scoped scan (`spawn_cell_scan`, just the buttons found within one
+    /// picked coarse cell) -- the labeling/matching logic doesn't need to know or care which.
     Hints { targets: Vec<HintTarget>, typed: String },
     /// The settings/cheat-sheet menu, opened by holding Super past the long-press threshold
     /// (see `toggle_menu()`). `+`/`-` adjust `Settings::nudge_step` live; Escape closes.
@@ -66,10 +69,10 @@ struct State {
 }
 
 /// Layer-shell namespace shared by all 15 grid-region windows (see `GridRegionWindow`), kept
-/// distinct from the main window's "omg-keys" namespace so a single Hyprland layer rule
+/// distinct from the main window's "omakeys" namespace so a single Hyprland layer rule
 /// (`no_screen_share` on this namespace -- see hyprland.lua) can exclude grid mode from
 /// screen capture/recording without also hiding hint mode or the menu from it.
-const GRID_REGION_NAMESPACE: &str = "omg-keys-grid";
+const GRID_REGION_NAMESPACE: &str = "omakeys-grid";
 
 /// One of the 15 small layer-shell windows tiling the screen into `grid::COARSE_KEYS`' 5x3
 /// coarse regions, used only for `Mode::TypingCoarse`/`Mode::TypingFine` rendering.
@@ -151,20 +154,20 @@ impl Overlay {
 
         let window = gtk::ApplicationWindow::builder()
             .application(app)
-            .title("omg-keys grid")
+            .title("omakeys grid")
             .decorated(false)
             .build();
 
         window.init_layer_shell();
         window.set_layer(Layer::Overlay);
-        window.set_namespace("omg-keys");
+        window.set_namespace("omakeys");
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
             window.set_anchor(edge, true);
         }
         window.set_exclusive_zone(-1);
         window.set_keyboard_mode(KeyboardMode::None);
 
-        // Make our own surface pointer-transparent -- omg-keys is 100% keyboard-driven, we
+        // Make our own surface pointer-transparent -- omakeys is 100% keyboard-driven, we
         // never need our own full-screen surface to receive real pointer input, and leaving
         // it receiving input (gtk4-layer-shell doesn't expose input-region control, so the
         // default is "whole surface") means it's the topmost thing at the cursor's position
@@ -332,7 +335,7 @@ impl Overlay {
         let pointer = match VirtualPointer::new(output_name.as_deref()) {
             Ok(p) => Some(p),
             Err(e) => {
-                log::error!("omg-keys: failed to create virtual pointer: {e}");
+                log::error!("omakeys: failed to create virtual pointer: {e}");
                 None
             }
         };
@@ -353,7 +356,7 @@ impl Overlay {
         let windows = match active_monitor::focused_monitor_windows() {
             Ok(windows) => windows,
             Err(e) => {
-                log::warn!("omg-keys: could not list windows on the focused monitor ({e})");
+                log::warn!("omakeys: could not list windows on the focused monitor ({e})");
                 Vec::new()
             }
         };
@@ -373,7 +376,7 @@ impl Overlay {
                         Ok(capture) => Some(vision::detect_regions(&capture, &windows_for_vision)),
                         Err(e) => {
                             log::warn!(
-                                "omg-keys: screenshot capture failed ({e}), skipping vision hints"
+                                "omakeys: screenshot capture failed ({e}), skipping vision hints"
                             );
                             None
                         }
@@ -390,7 +393,7 @@ impl Overlay {
             let elements = match atspi_scan::scan_interactive_elements(&windows).await {
                 Ok(elements) => elements,
                 Err(e) => {
-                    log::error!("omg-keys: AT-SPI scan failed: {e}");
+                    log::error!("omakeys: AT-SPI scan failed: {e}");
                     Vec::new()
                 }
             };
@@ -400,7 +403,7 @@ impl Overlay {
             let vision_count = vision_regions.len();
             let targets = hints::assign_labels(elements, vision_regions);
             log::info!(
-                "omg-keys: found {atspi_count} AT-SPI elements + {vision_count} vision \
+                "omakeys: found {atspi_count} AT-SPI elements + {vision_count} vision \
                  regions ({} after merging) on the focused monitor",
                 targets.len()
             );
@@ -408,7 +411,7 @@ impl Overlay {
                 for t in &targets {
                     let (x, y, w, h) = t.geometry();
                     let src = if matches!(t.source, hints::Source::Vision(_)) { "vision" } else { "atspi" };
-                    log::debug!("omg-keys: target [{}] {src} x={x} y={y} w={w} h={h}", t.label);
+                    log::debug!("omakeys: target [{}] {src} x={x} y={y} w={w} h={h}", t.label);
                 }
             }
             let mut s = state.borrow_mut();
@@ -446,7 +449,7 @@ impl Overlay {
         let output_name = match active_monitor::focused_output_name() {
             Ok(name) => Some(name),
             Err(e) => {
-                log::warn!("omg-keys: could not determine focused monitor ({e})");
+                log::warn!("omakeys: could not determine focused monitor ({e})");
                 None
             }
         };
@@ -471,7 +474,7 @@ impl Overlay {
         let pointer = match VirtualPointer::new(output_name.as_deref()) {
             Ok(p) => Some(p),
             Err(e) => {
-                log::error!("omg-keys: failed to create virtual pointer: {e}");
+                log::error!("omakeys: failed to create virtual pointer: {e}");
                 None
             }
         };
@@ -601,6 +604,11 @@ fn handle_key(
             if let Some(c) = ch {
                 if grid::is_coarse_key(c) {
                     s.mode = Mode::TypingFine(c);
+                    // The generic fine sub-grid shows immediately either way (no keystroke
+                    // ever gets *slower* because of this) -- this scan only ever
+                    // opportunistically upgrades the experience if it resolves before the
+                    // user's next keystroke does. See `spawn_cell_scan`'s doc comment.
+                    spawn_cell_scan(state.clone(), drawing_area.clone(), window.clone(), grid_windows.to_vec(), c);
                 }
             }
         }
@@ -726,7 +734,7 @@ fn handle_key(
                 s.settings.nudge_step =
                     (s.settings.nudge_step + delta).clamp(NUDGE_STEP_MIN, NUDGE_STEP_MAX);
                 if let Err(e) = config::save(&s.settings) {
-                    log::warn!("omg-keys: failed to save settings: {e}");
+                    log::warn!("omakeys: failed to save settings: {e}");
                 }
             }
         }
@@ -751,7 +759,7 @@ fn handle_key(
 fn forward_typed_character(c: char) {
     std::thread::sleep(std::time::Duration::from_millis(40));
     if let Err(e) = std::process::Command::new("wtype").arg(c.to_string()).status() {
-        log::warn!("omg-keys: failed to forward typed character via wtype ({e}) -- is wtype installed?");
+        log::warn!("omakeys: failed to forward typed character via wtype ({e}) -- is wtype installed?");
     }
 }
 
@@ -833,6 +841,103 @@ fn handle_hint_key(s: &mut State, keyval: gdk4::Key, ch: Option<char>, window: &
     }
 }
 
+/// Kick off an AT-SPI scan of just `coarse`'s screen region, the moment its coarse key is
+/// pressed -- runs *alongside* the generic fine sub-grid (already shown synchronously in
+/// `handle_key`'s `Mode::TypingCoarse` branch before this is even called), not instead of it,
+/// since AT-SPI is inherently async and can easily take longer than the user's next
+/// keystroke. Only "buttons" (`atspi_scan::Category::Button`) are considered -- unlike full
+/// hint mode's text-fields/scrollables/terminals too, a button is safe to act on without
+/// requiring the user to confirm first, which is what makes auto-clicking a lone one
+/// reasonable at all.
+///
+/// If/when the scan resolves *while we're still in `Mode::TypingFine(coarse)` for this exact
+/// coarse key* (checked at completion -- the user may have already picked a fine cell, nudged
+/// off it, moved to a different coarse region, or closed the overlay entirely in the
+/// meantime, in which case this is stale and does nothing):
+/// - zero buttons found: leaves the generic fine grid exactly as it is, unchanged.
+/// - exactly one: warps the pointer to it and clicks, no further keystroke needed at all.
+/// - more than one: switches to `Mode::Hints`, labeling just those buttons -- the same
+///   labeling/matching machinery whole-screen hint mode already uses, just pre-scoped to a
+///   15th of the screen instead of the whole monitor.
+fn spawn_cell_scan(
+    state: Rc<RefCell<State>>,
+    drawing_area: gtk::DrawingArea,
+    window: gtk::ApplicationWindow,
+    grid_windows: Vec<GridRegionWindow>,
+    coarse: char,
+) {
+    let Some(region) = ({
+        let s = state.borrow();
+        grid::coarse_region_bounds(&s.cells, coarse)
+    }) else {
+        return;
+    };
+    let (region_x, region_y, region_w, region_h) = region;
+
+    glib::spawn_future_local(async move {
+        let windows = match active_monitor::focused_monitor_windows() {
+            Ok(windows) => windows,
+            Err(e) => {
+                log::warn!("omakeys: could not list windows for cell scan ({e})");
+                Vec::new()
+            }
+        };
+        let elements = match atspi_scan::scan_interactive_elements(&windows).await {
+            Ok(elements) => elements,
+            Err(e) => {
+                log::error!("omakeys: AT-SPI scan failed for cell scan: {e}");
+                Vec::new()
+            }
+        };
+
+        let buttons: Vec<atspi_scan::Element> = elements
+            .into_iter()
+            .filter(|e| e.category == atspi_scan::Category::Button)
+            .filter(|e| {
+                let (cx, cy) = e.center();
+                cx >= region_x && cx < region_x + region_w && cy >= region_y && cy < region_y + region_h
+            })
+            .collect();
+        log::info!("omakeys: cell scan for '{coarse}' found {} button(s)", buttons.len());
+
+        // Stale-result guard -- see the doc comment above.
+        if !matches!(state.borrow().mode, Mode::TypingFine(c) if c == coarse) {
+            return;
+        }
+
+        match buttons.len() {
+            0 => {}
+            1 => {
+                let (cx, cy) = buttons[0].center();
+                let mut s = state.borrow_mut();
+                let (screen_w, screen_h) = (s.screen_w, s.screen_h);
+                if let Some(p) = s.pointer.as_mut() {
+                    let _ = p.move_to(cx, cy, screen_w, screen_h);
+                }
+                s.mode = Mode::Hidden;
+                drop(s);
+                window.set_keyboard_mode(KeyboardMode::None);
+                window.set_visible(false);
+                hide_grid_windows(&grid_windows);
+                let mut s = state.borrow_mut();
+                if let Some(p) = s.pointer.as_mut() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let _ = p.click(BTN_LEFT);
+                }
+                s.pointer = None;
+                drop(s);
+                drawing_area.queue_draw();
+            }
+            _ => {
+                let targets = hints::assign_labels(buttons, Vec::new());
+                state.borrow_mut().mode = Mode::Hints { targets, typed: String::new() };
+                hide_grid_windows(&grid_windows);
+                drawing_area.queue_draw();
+            }
+        }
+    });
+}
+
 fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
     match &state.mode {
         Mode::Hidden => {}
@@ -870,7 +975,7 @@ fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State) {
 }
 
 fn draw_no_hints_message(cr: &cairo::Context, width: f64, _height: f64) {
-    let text = "omg-keys: no hintable elements found here — try Right Shift/Super for grid mode instead — Esc to close";
+    let text = "omakeys: no hintable elements found here — try Right Shift/Super for grid mode instead — Esc to close";
     cr.select_font_face("sans-serif", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
     cr.set_font_size(15.0);
     if let Ok(extents) = cr.text_extents(text) {
@@ -903,7 +1008,7 @@ const CHEAT_SHEET: &[(&str, &str)] = &[
 ];
 
 fn draw_menu(cr: &cairo::Context, width: f64, height: f64, nudge_step: f64) {
-    let title = "omg-keys";
+    let title = "omakeys";
     let row_h = 26.0;
     let padding = 24.0;
     let title_h = 40.0;

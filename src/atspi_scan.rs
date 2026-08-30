@@ -133,7 +133,7 @@ pub async fn scan_interactive_elements(windows: &[FocusedWindow]) -> Result<Vec<
         .await
         .is_none();
         if timed_out {
-            log::warn!("omg-keys: AT-SPI app {dest} timed out during scan, skipping");
+            log::warn!("omakeys: AT-SPI app {dest} timed out during scan, skipping");
         }
     }
 

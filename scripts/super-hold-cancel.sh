@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/omg-keys-super-hold.pid"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/omakeys-super-hold.pid"
 
 if [ -f "$PIDFILE" ]; then
     kill "$(cat "$PIDFILE")" 2>/dev/null || true

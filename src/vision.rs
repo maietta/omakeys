@@ -232,7 +232,7 @@ pub fn detect_regions(capture: &Capture, windows: &[FocusedWindow]) -> Vec<Visio
     if !DEBUG_SECTIONS_ONLY {
         let Some(gray_img) = image::GrayImage::from_raw(capture.width, capture.height, capture.gray.clone())
         else {
-            log::error!("omg-keys: captured buffer size didn't match its own width/height");
+            log::error!("omakeys: captured buffer size didn't match its own width/height");
             return Vec::new();
         };
         let edges = imageproc::edges::canny(&gray_img, 20.0, 50.0);
@@ -408,7 +408,7 @@ fn detect_dividers_recursive(
         top_rows.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
         top_rows.truncate(12);
         log::debug!(
-            "omg-keys: divider debug window=({wx},{wy},{ww},{wh}) col_threshold={col_threshold} \
+            "omakeys: divider debug window=({wx},{wy},{ww},{wh}) col_threshold={col_threshold} \
              row_threshold={row_threshold}\n  top cols (x, count, %): {}\n  top rows (y, count, %): {}",
             top_cols
                 .iter()
@@ -449,7 +449,7 @@ fn detect_dividers_recursive(
     merge_adjacent(&mut xs, DIVIDER_MERGE_GAP);
     merge_adjacent(&mut ys, DIVIDER_MERGE_GAP);
 
-    log::debug!("omg-keys: merged xs={xs:?} ys={ys:?} for window=({wx},{wy},{ww},{wh})");
+    log::debug!("omakeys: merged xs={xs:?} ys={ys:?} for window=({wx},{wy},{ww},{wh})");
 
     // No real divider found in *either* direction -- gridding would just produce the
     // window's own full bounds as a single degenerate "cell", which isn't what this
@@ -631,6 +631,589 @@ fn iou(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> f64 {
     } else {
         intersection / union
     }
+}
+
+// ===== Seed-growth box detection (experimental alternative to detect_dividers_as_grid) =====
+//
+// `detect_dividers_as_grid` above finds structure by exhaustively scanning every row/column
+// of a window and voting on density -- effectively a brute-force, axis-aligned Hough
+// transform. This is a different strategy: scatter a dense field of seed points across the
+// window, and from each one, grow outward until it "feels" a boundary -- ray-cast in each of
+// the 4 cardinal directions to the nearest strong intensity step, then trace along that step
+// perpendicular to the ray to find its actual extent (a single ray-cast only ever finds one
+// point on a line; tracing is what turns that into a real, length-bearing `Segment`).
+//
+// A real box's opposite sides are the same length, so after merging duplicate detections
+// (many different seeds commonly rediscover the same real divider), only segments whose
+// length is matched by *another* segment of the same orientation survive -- an isolated
+// segment with no length partner is discarded as incidental content rather than kept as
+// structure. A candidate box only exists where a matched vertical pair (left/right) and a
+// matched horizontal pair (top/bottom) are *mutually* consistent -- the horizontal pair's
+// span lines up with the vertical pair's x-positions and vice versa -- which is what "finding
+// the 4 corners" actually means here, not just crossing every detected x against every
+// detected y. A final narrow rescan around each rough edge (reusing the same per-pixel test
+// the exhaustive scan above uses, but over a strip only a few pixels wide) snaps it to the
+// position of maximum edge-pixel density before the box is finalized.
+//
+// Not yet wired into `detect_regions()`'s live pipeline -- exercised only by the tests below
+// for now, so it can be evaluated on its own before deciding whether it replaces or
+// complements `detect_dividers_as_grid`.
+
+/// Spacing between seed points before jitter, in pixels -- "tight density": dense enough that
+/// a real divider spanning any reasonable distance gets discovered (and traced) by many
+/// independent seeds, which is what makes cross-seed agreement meaningful rather than
+/// coincidental.
+const SEED_SPACING: i32 = 32;
+
+/// Random jitter applied to each seed's position (+-half spacing). Seeds aren't placed on a
+/// perfectly regular grid so there's no single systematic offset where every seed's ray
+/// happens to land in the same blind spot relative to periodic content (e.g. text
+/// line-height) every time -- true per-seed randomness would do this too, but a seeded PRNG
+/// keeps growth deterministic and testable, at the cost of coverage being evenly spread
+/// rather than genuinely random.
+const SEED_JITTER: i32 = SEED_SPACING / 2;
+
+/// Max ray-cast distance from a seed before giving up in that direction -- bounds the cost of
+/// growing from a seed sitting in a large blank area.
+const MAX_RAY_DISTANCE: i32 = 2000;
+
+/// Small gap (in the direction *along* an already-found edge) tolerated while tracing it
+/// before giving up -- a real divider is occasionally interrupted by overlapping content (see
+/// `DIVIDER_SPAN_COVERAGE`'s doc comment above for the same phenomenon), so stopping at the
+/// very first miss would chop a real divider into short, useless fragments.
+const TRACE_GAP_TOLERANCE: i32 = 6;
+
+/// Two segments of the same orientation, with `fixed` coordinates within this many pixels of
+/// each other and overlapping/adjacent ranges, are treated as re-discoveries of the same real
+/// line by different seeds and merged into one.
+const SEGMENT_MERGE_GAP: i32 = 4;
+
+/// Two segments' lengths are considered "the same" -- candidate opposite sides of one box --
+/// if they're within this fraction of the longer one.
+const LENGTH_MATCH_TOLERANCE: f64 = 0.08;
+
+/// How far around a rough candidate edge to exhaustively rescan for the true peak-density
+/// position -- the "finer sampling" pass: growth finds *roughly* where a real divider is
+/// cheaply; this narrow, precise rescan (the same per-column/per-row density counting
+/// `detect_dividers_recursive` uses over the whole window, but over a strip only a few pixels
+/// wide) nails down its exact pixel position before a box's corners are finalized.
+const REFINE_MARGIN: i32 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orientation {
+    /// A vertical line/divider -- detected by a strong step between horizontally-adjacent
+    /// pixels. Its `Segment::fixed` is an x-coordinate, `start`/`end` a y-range.
+    Vertical,
+    /// A horizontal line/divider -- detected by a strong step between vertically-adjacent
+    /// pixels. Its `Segment::fixed` is a y-coordinate, `start`/`end` an x-range.
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Segment {
+    pub(crate) orientation: Orientation,
+    pub(crate) fixed: i32,
+    pub(crate) start: i32,
+    pub(crate) end: i32,
+}
+
+impl Segment {
+    pub(crate) fn length(&self) -> i32 {
+        self.end - self.start
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RayDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Deterministic pseudo-random generator (xorshift32) -- only ever used to jitter seed
+/// positions a few pixels, so pulling in the `rand` crate for it isn't worth it; determinism
+/// also keeps growth reproducible/testable rather than flaky.
+struct Xorshift32(u32);
+
+impl Xorshift32 {
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    /// Uniform in `[-bound, bound]`.
+    fn jitter(&mut self, bound: i32) -> i32 {
+        if bound <= 0 {
+            return 0;
+        }
+        (self.next() % (2 * bound as u32 + 1)) as i32 - bound
+    }
+}
+
+/// Is there a strong raw intensity step at `(x, y)` in the direction implied by
+/// `orientation` -- a horizontal step (between x-1 and x) for `Vertical` (what a vertical
+/// line produces), a vertical step (between y-1 and y) for `Horizontal`. Deliberately the same
+/// raw-adjacent-pixel-difference test `detect_dividers_recursive` uses (see
+/// `DIVIDER_RAW_DIFF_THRESHOLD`'s doc comment for why Canny's blur is unsuitable here) --
+/// factored out so both the exhaustive scan and this seed-growth path share one definition of
+/// "edge pixel".
+pub(crate) fn is_edge_pixel(gray: &[u8], img_w: u32, img_h: u32, x: i32, y: i32, orientation: Orientation) -> bool {
+    if x < 0 || y < 0 || x >= img_w as i32 || y >= img_h as i32 {
+        return false;
+    }
+    let px = |x: i32, y: i32| -> i32 { gray[y as usize * img_w as usize + x as usize] as i32 };
+    match orientation {
+        Orientation::Vertical => x > 0 && (px(x, y) - px(x - 1, y)).abs() >= DIVIDER_RAW_DIFF_THRESHOLD,
+        Orientation::Horizontal => y > 0 && (px(x, y) - px(x, y - 1)).abs() >= DIVIDER_RAW_DIFF_THRESHOLD,
+    }
+}
+
+/// Walk from `(sx, sy)` in `dir` until finding a pixel where `is_edge_pixel` holds for the
+/// orientation that direction probes for (Left/Right probe for a *vertical* divider, Up/Down
+/// for a *horizontal* one), up to `MAX_RAY_DISTANCE` or `window`'s own edge. Returns the hit
+/// point and the orientation it implies, if any -- this is the "feeling out" step, one ray at
+/// a time.
+pub(crate) fn ray_cast(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    (sx, sy): (i32, i32),
+    dir: RayDirection,
+    (wx, wy, ww, wh): (i32, i32, i32, i32),
+) -> Option<(i32, i32, Orientation)> {
+    let (dx, dy, orientation, limit) = match dir {
+        RayDirection::Left => (-1, 0, Orientation::Vertical, wx),
+        RayDirection::Right => (1, 0, Orientation::Vertical, wx + ww - 1),
+        RayDirection::Up => (0, -1, Orientation::Horizontal, wy),
+        RayDirection::Down => (0, 1, Orientation::Horizontal, wy + wh - 1),
+    };
+    let (mut x, mut y) = (sx, sy);
+    for _ in 0..MAX_RAY_DISTANCE {
+        x += dx;
+        y += dy;
+        if dx > 0 && x > limit || dx < 0 && x < limit || dy > 0 && y > limit || dy < 0 && y < limit {
+            return None;
+        }
+        if is_edge_pixel(gray, img_w, img_h, x, y, orientation) {
+            return Some((x, y, orientation));
+        }
+    }
+    None
+}
+
+/// Walk outward from `(hx, hy)` (a point already known to be an edge pixel of `orientation`)
+/// in both directions along the edge's own length, extending as far as the edge condition
+/// keeps holding (within `TRACE_GAP_TOLERANCE`), to find its full span. A ray-cast only ever
+/// finds one point on a divider; this is what turns that into an actual `Segment` with a real
+/// length to compare against others.
+pub(crate) fn trace_edge(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    (hx, hy): (i32, i32),
+    orientation: Orientation,
+    (wx, wy, ww, wh): (i32, i32, i32, i32),
+) -> Segment {
+    let (fixed, along, lo, hi) = match orientation {
+        Orientation::Vertical => (hx, hy, wy, wy + wh - 1),
+        Orientation::Horizontal => (hy, hx, wx, wx + ww - 1),
+    };
+    let test = |along: i32| -> bool {
+        let (x, y) = match orientation {
+            Orientation::Vertical => (fixed, along),
+            Orientation::Horizontal => (along, fixed),
+        };
+        is_edge_pixel(gray, img_w, img_h, x, y, orientation)
+    };
+
+    let mut start = along;
+    let mut cursor = along;
+    let mut gap = 0;
+    while cursor > lo {
+        cursor -= 1;
+        if test(cursor) {
+            start = cursor;
+            gap = 0;
+        } else {
+            gap += 1;
+            if gap > TRACE_GAP_TOLERANCE {
+                break;
+            }
+        }
+    }
+
+    let mut end = along;
+    let mut cursor = along;
+    let mut gap = 0;
+    while cursor < hi {
+        cursor += 1;
+        if test(cursor) {
+            end = cursor;
+            gap = 0;
+        } else {
+            gap += 1;
+            if gap > TRACE_GAP_TOLERANCE {
+                break;
+            }
+        }
+    }
+
+    Segment { orientation, fixed, start, end }
+}
+
+/// Scatter seeds across `window` on a jittered grid (see `SEED_SPACING`/`SEED_JITTER`) and
+/// grow a `Segment` from every ray-cast hit at each one.
+/// Jittered-grid seed positions across `window` -- see `SEED_SPACING`/`SEED_JITTER`. Factored
+/// out of `grow_segments` so `growth_viz` (an animated step-by-step visualization of this
+/// algorithm, for a human to actually watch it run) can drive the exact same seed placement a
+/// real detection pass uses, one seed at a time, instead of only ever seeing the final result.
+pub(crate) fn seed_positions(window: (i32, i32, i32, i32)) -> Vec<(i32, i32)> {
+    let (wx, wy, ww, wh) = window;
+    let mut rng = Xorshift32((wx as u32).wrapping_mul(2_654_435_761).wrapping_add(wy as u32) ^ 0x9E37_79B9);
+    let mut seeds = Vec::new();
+
+    let mut sy = wy + SEED_SPACING / 2;
+    while sy < wy + wh {
+        let mut sx = wx + SEED_SPACING / 2;
+        while sx < wx + ww {
+            seeds.push((
+                (sx + rng.jitter(SEED_JITTER)).clamp(wx, wx + ww - 1),
+                (sy + rng.jitter(SEED_JITTER)).clamp(wy, wy + wh - 1),
+            ));
+            sx += SEED_SPACING;
+        }
+        sy += SEED_SPACING;
+    }
+    seeds
+}
+
+fn grow_segments(gray: &[u8], img_w: u32, img_h: u32, window: (i32, i32, i32, i32)) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    for seed in seed_positions(window) {
+        for dir in [RayDirection::Left, RayDirection::Right, RayDirection::Up, RayDirection::Down] {
+            if let Some((hx, hy, orientation)) = ray_cast(gray, img_w, img_h, seed, dir, window) {
+                segments.push(trace_edge(gray, img_w, img_h, (hx, hy), orientation, window));
+            }
+        }
+    }
+    segments
+}
+
+/// Consolidate segments that are almost certainly re-discoveries of the same real divider by
+/// different seeds -- same orientation, `fixed` within `SEGMENT_MERGE_GAP`, and
+/// overlapping/adjacent ranges get unioned into one.
+pub(crate) fn merge_segments(mut segments: Vec<Segment>) -> Vec<Segment> {
+    segments.sort_by_key(|s| (matches!(s.orientation, Orientation::Horizontal), s.fixed, s.start));
+    let mut merged: Vec<Segment> = Vec::new();
+    for seg in segments {
+        if let Some(last) = merged.last_mut() {
+            if last.orientation == seg.orientation
+                && (seg.fixed - last.fixed).abs() <= SEGMENT_MERGE_GAP
+                && seg.start <= last.end + SEGMENT_MERGE_GAP
+            {
+                last.start = last.start.min(seg.start);
+                last.end = last.end.max(seg.end);
+                continue;
+            }
+        }
+        merged.push(seg);
+    }
+    merged
+}
+
+fn lengths_match(a: i32, b: i32) -> bool {
+    if a <= 0 || b <= 0 {
+        return false;
+    }
+    (a - b).abs() as f64 <= a.max(b) as f64 * LENGTH_MATCH_TOLERANCE
+}
+
+/// Every pair of same-orientation segments whose lengths match closely enough to be
+/// candidate opposite sides of one box -- see the module-level doc comment above.
+pub(crate) fn length_matched_pairs(segments: &[Segment], orientation: Orientation) -> Vec<(Segment, Segment)> {
+    let same: Vec<&Segment> = segments.iter().filter(|s| s.orientation == orientation).collect();
+    let mut pairs = Vec::new();
+    for i in 0..same.len() {
+        for j in (i + 1)..same.len() {
+            if lengths_match(same[i].length(), same[j].length()) {
+                let (a, b) = if same[i].fixed <= same[j].fixed { (same[i], same[j]) } else { (same[j], same[i]) };
+                pairs.push((*a, *b));
+            }
+        }
+    }
+    pairs
+}
+
+fn coord_matches(a: i32, b: i32) -> bool {
+    (a - b).abs() <= SEGMENT_MERGE_GAP * 2
+}
+
+/// Snap a rough vertical edge (candidate x) to the x within `REFINE_MARGIN` with the most
+/// edge pixels over `y_range` -- the "finer sampling" pass, see `REFINE_MARGIN`.
+fn refine_vertical_edge(gray: &[u8], img_w: u32, img_h: u32, x_rough: i32, y_range: (i32, i32)) -> i32 {
+    let (y0, y1) = y_range;
+    (x_rough - REFINE_MARGIN..=x_rough + REFINE_MARGIN)
+        .filter(|&x| x > 0 && x < img_w as i32)
+        .max_by_key(|&x| {
+            (y0.max(0)..y1.min(img_h as i32)).filter(|&y| is_edge_pixel(gray, img_w, img_h, x, y, Orientation::Vertical)).count()
+        })
+        .unwrap_or(x_rough)
+}
+
+/// Snap a rough horizontal edge (candidate y) to the y within `REFINE_MARGIN` with the most
+/// edge pixels over `x_range` -- see `refine_vertical_edge`.
+fn refine_horizontal_edge(gray: &[u8], img_w: u32, img_h: u32, y_rough: i32, x_range: (i32, i32)) -> i32 {
+    let (x0, x1) = x_range;
+    (y_rough - REFINE_MARGIN..=y_rough + REFINE_MARGIN)
+        .filter(|&y| y > 0 && y < img_h as i32)
+        .max_by_key(|&y| {
+            (x0.max(0)..x1.min(img_w as i32)).filter(|&x| is_edge_pixel(gray, img_w, img_h, x, y, Orientation::Horizontal)).count()
+        })
+        .unwrap_or(y_rough)
+}
+
+/// From matched vertical pairs (candidate left/right box edges) and matched horizontal pairs
+/// (candidate top/bottom edges), keep only combinations where all four sides are *mutually*
+/// consistent -- the horizontal pair's span matches the vertical pair's x-positions, and the
+/// vertical pair's span matches the horizontal pair's y-positions. This is what "finding the
+/// 4 corners" means here: an incidental length coincidence on one axis alone, with nothing
+/// matching it on the other, never produces a box.
+pub(crate) fn boxes_from_pairs(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    v_pairs: &[(Segment, Segment)],
+    h_pairs: &[(Segment, Segment)],
+) -> Vec<(i32, i32, i32, i32)> {
+    let mut boxes = Vec::new();
+    for &(vl, vr) in v_pairs {
+        let (x0, x1) = (vl.fixed, vr.fixed);
+        let (y0, y1) = (vl.start.max(vr.start), vl.end.min(vr.end));
+        if x1 - x0 < MIN_PANEL_SIZE || y1 - y0 < MIN_PANEL_SIZE {
+            continue;
+        }
+        for &(ht, hb) in h_pairs {
+            if !coord_matches(ht.fixed, y0) || !coord_matches(hb.fixed, y1) {
+                continue;
+            }
+            let (hx0, hx1) = (ht.start.min(hb.start), ht.end.max(hb.end));
+            if !coord_matches(hx0, x0) || !coord_matches(hx1, x1) {
+                continue;
+            }
+
+            let rx0 = refine_vertical_edge(gray, img_w, img_h, x0, (y0, y1));
+            let rx1 = refine_vertical_edge(gray, img_w, img_h, x1, (y0, y1));
+            let ry0 = refine_horizontal_edge(gray, img_w, img_h, y0, (rx0, rx1));
+            let ry1 = refine_horizontal_edge(gray, img_w, img_h, y1, (rx0, rx1));
+            if rx1 > rx0 && ry1 > ry0 {
+                boxes.push((rx0, ry0, rx1 - rx0, ry1 - ry0));
+            }
+        }
+    }
+    boxes
+}
+
+/// Detect box-shaped UI regions by growing outward from a dense field of seed points, rather
+/// than exhaustively scanning every row/column of `window` -- see the module-level doc
+/// comment above for the full algorithm. Experimental alternative to `detect_dividers_as_grid`,
+/// not yet wired into `detect_regions()`'s live pipeline.
+fn detect_regions_by_growth(gray: &[u8], img_w: u32, img_h: u32, window: (i32, i32, i32, i32)) -> Vec<(i32, i32, i32, i32)> {
+    let (_, _, ww, wh) = window;
+    if ww < MIN_PANEL_SIZE || wh < MIN_PANEL_SIZE {
+        return Vec::new();
+    }
+    let segments = grow_segments(gray, img_w, img_h, window);
+    let merged = merge_segments(segments);
+    let v_pairs = length_matched_pairs(&merged, Orientation::Vertical);
+    let h_pairs = length_matched_pairs(&merged, Orientation::Horizontal);
+    let mut boxes = boxes_from_pairs(gray, img_w, img_h, &v_pairs, &h_pairs);
+    boxes.sort_unstable();
+    boxes.dedup();
+    boxes
+}
+
+// ===== Full-scan line detection (a third, deliberately naive alternative) =====
+//
+// The most literal version of "slice the screen one pixel-row at a time, left to right, all
+// the way from top to bottom, note every place the color changes, then see which positions a
+// lot of the slices agree on." Every row is tested for vertical edges (a color-change scanning
+// left to right implies a vertical divider at that x) and every column for horizontal edges
+// (top to bottom implies a horizontal divider at that y) -- exhaustively, no sampling. A
+// position only survives if at least `FULL_SCAN_MATCH_FRACTION` of the rows/columns that
+// crossed it agree there's a change there.
+//
+// This is deliberately undecorated -- unlike `detect_dividers_as_grid` above (density + span +
+// local-peak-ratio, tuned over several rounds against real false positives -- see its own
+// extensive doc comments), this keeps only the one filter the idea itself describes: count
+// matches, keep what a lot of them agree on. Also deliberately distinct from the seed-growth
+// detector above: that one only *samples* the image (sparse seeds + short rays); this one
+// looks at every single pixel.
+
+/// Fraction of rows/columns that must agree a change happens at the same x/y for it to count
+/// as a real line -- "if a lot of them match." The only filter this detector applies.
+const FULL_SCAN_MATCH_FRACTION: f64 = 0.5;
+
+/// Scan every row and column of `window` exactly once (reusing `is_edge_pixel`'s raw-
+/// intensity-step test -- see `DIVIDER_RAW_DIFF_THRESHOLD` for why raw differencing rather than
+/// Canny), and tally how many rows report a color change at each x, and how many columns
+/// report one at each y.
+pub(crate) fn full_scan_counts(gray: &[u8], img_w: u32, img_h: u32, window: (i32, i32, i32, i32)) -> (Vec<u32>, Vec<u32>) {
+    let (wx, wy, ww, wh) = window;
+    let mut col_counts = vec![0u32; ww.max(0) as usize];
+    let mut row_counts = vec![0u32; wh.max(0) as usize];
+    for y in wy..wy + wh {
+        for x in wx..wx + ww {
+            if is_edge_pixel(gray, img_w, img_h, x, y, Orientation::Vertical) {
+                col_counts[(x - wx) as usize] += 1;
+            }
+            if is_edge_pixel(gray, img_w, img_h, x, y, Orientation::Horizontal) {
+                row_counts[(y - wy) as usize] += 1;
+            }
+        }
+    }
+    (col_counts, row_counts)
+}
+
+/// Keep only the x/y positions enough rows/columns agree on -- see `FULL_SCAN_MATCH_FRACTION`.
+pub(crate) fn full_scan_lines(gray: &[u8], img_w: u32, img_h: u32, window: (i32, i32, i32, i32)) -> (Vec<i32>, Vec<i32>) {
+    full_scan_lines_impl(gray, img_w, img_h, window, FullScanOptions::default())
+}
+
+/// Same density-threshold filter as `full_scan_lines`, plus one more check: a surviving
+/// position must be a genuine local peak against its own neighborhood, not just part of a
+/// broad band of similarly-dense neighbors (`is_local_peak`/`DIVIDER_PEAK_RATIO` -- the same
+/// check `detect_dividers_as_grid` already uses, and for the same reason: ordinary text has
+/// enough of its own internal rhythm -- consistent indentation columns, evenly-spaced line
+/// baselines -- that a bare "half the rows/columns agree" threshold clears just as easily
+/// over a paragraph as over a real divider, which is exactly what `full_scan_lines` alone
+/// demonstrated against a live capture -- see growth_viz/fullscan_viz's comparison). Added
+/// specifically to test how much of that false-positive problem this one extra check fixes
+/// on its own -- turned out, against a live capture, to be "not much": see
+/// `full_scan_lines_with_uniformity_check` below for the other, complementary failure mode
+/// this one doesn't address.
+pub(crate) fn full_scan_lines_with_peak_check(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    window: (i32, i32, i32, i32),
+) -> (Vec<i32>, Vec<i32>) {
+    full_scan_lines_impl(gray, img_w, img_h, window, FullScanOptions { peak_check: true, uniformity_check: false })
+}
+
+/// Same density-threshold filter as `full_scan_lines`, plus a different extra check: a
+/// surviving position's edge *step size* must be reasonably consistent all along its own
+/// span, not wildly variable.
+///
+/// This is a deliberately different signal from sampling the flatness of the underlying
+/// pixels themselves (`std_dev`, used elsewhere in this file for small-control candidates) --
+/// that was already tried for `detect_dividers_as_grid` and reverted (see `LineStats`'s doc
+/// comment): a real full-length divider often crosses several visually distinct background
+/// regions along its run (a title bar, then a body, then a different panel's background), so
+/// the *underlying pixels* it passes through aren't flat end-to-end, while a sparse line of
+/// text can look deceptively flat overall (mostly background, a few text pixels) -- confirmed
+/// backwards on a live capture there (the real divider measured a *higher* std-dev than a
+/// false-positive text row). What should still hold, even while crossing different
+/// backgrounds, is that a real divider's own border contrast is close to constant wherever
+/// it's crossed (it's drawn the same way throughout), whereas individual text-glyph edges (a
+/// thin serif, a bold stroke, an anti-aliased curve) vary in step size much more than one
+/// uniform rule does -- so this measures std-dev of the *edge magnitude*, not the pixel
+/// values, sampled only at the pixels that actually registered as an edge.
+pub(crate) fn full_scan_lines_with_uniformity_check(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    window: (i32, i32, i32, i32),
+) -> (Vec<i32>, Vec<i32>) {
+    full_scan_lines_impl(gray, img_w, img_h, window, FullScanOptions { peak_check: false, uniformity_check: true })
+}
+
+/// Std-dev of the raw diff *magnitude* is treated as "uniform enough" up to this value --
+/// tuned against a live capture (see fullscan_viz's comparison output), not derived
+/// analytically.
+const MAX_EDGE_MAGNITUDE_STD_DEV: f64 = 35.0;
+
+/// Std-dev of the intensity-step magnitude among the pixels that registered as an edge along
+/// one candidate line (`fixed` = x for a vertical candidate, y for horizontal; `lo..hi` is
+/// that line's full span) -- see `full_scan_lines_with_uniformity_check`'s doc comment for why
+/// this, not `std_dev` of the underlying pixel values.
+fn edge_magnitude_std_dev(gray: &[u8], img_w: u32, img_h: u32, fixed: i32, (lo, hi): (i32, i32), orientation: Orientation) -> f64 {
+    let px = |x: i32, y: i32| -> i32 { gray[y as usize * img_w as usize + x as usize] as i32 };
+    let mut magnitudes = Vec::new();
+    for along in lo..hi {
+        let (x, y) = match orientation {
+            Orientation::Vertical => (fixed, along),
+            Orientation::Horizontal => (along, fixed),
+        };
+        if !is_edge_pixel(gray, img_w, img_h, x, y, orientation) {
+            continue;
+        }
+        let magnitude = match orientation {
+            Orientation::Vertical => (px(x, y) - px(x - 1, y)).abs(),
+            Orientation::Horizontal => (px(x, y) - px(x, y - 1)).abs(),
+        };
+        magnitudes.push(magnitude as f64);
+    }
+    if magnitudes.len() < 2 {
+        return 0.0;
+    }
+    let mean = magnitudes.iter().sum::<f64>() / magnitudes.len() as f64;
+    let variance = magnitudes.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / magnitudes.len() as f64;
+    variance.sqrt()
+}
+
+#[derive(Clone, Copy, Default)]
+struct FullScanOptions {
+    peak_check: bool,
+    uniformity_check: bool,
+}
+
+fn full_scan_lines_impl(
+    gray: &[u8],
+    img_w: u32,
+    img_h: u32,
+    window: (i32, i32, i32, i32),
+    options: FullScanOptions,
+) -> (Vec<i32>, Vec<i32>) {
+    let (wx, wy, ww, wh) = window;
+    let (col_counts, row_counts) = full_scan_counts(gray, img_w, img_h, window);
+    let col_threshold = (wh as f64 * FULL_SCAN_MATCH_FRACTION) as u32;
+    let row_threshold = (ww as f64 * FULL_SCAN_MATCH_FRACTION) as u32;
+
+    let survives = |counts: &[u32], i: usize, c: u32, threshold: u32, fixed: i32, span: (i32, i32), orientation: Orientation| -> bool {
+        if c < threshold {
+            return false;
+        }
+        if options.peak_check && !is_local_peak(counts, i, DIVIDER_PEAK_OFFSET_MIN, DIVIDER_PEAK_OFFSET_MAX, DIVIDER_PEAK_RATIO) {
+            return false;
+        }
+        if options.uniformity_check
+            && edge_magnitude_std_dev(gray, img_w, img_h, fixed, span, orientation) > MAX_EDGE_MAGNITUDE_STD_DEV
+        {
+            return false;
+        }
+        true
+    };
+
+    let mut xs: Vec<i32> = col_counts
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| survives(&col_counts, i, c, col_threshold, wx + i as i32, (wy, wy + wh), Orientation::Vertical))
+        .map(|(i, _)| wx + i as i32)
+        .collect();
+    let mut ys: Vec<i32> = row_counts
+        .iter()
+        .enumerate()
+        .filter(|&(i, &c)| survives(&row_counts, i, c, row_threshold, wy + i as i32, (wx, wx + ww), Orientation::Horizontal))
+        .map(|(i, _)| wy + i as i32)
+        .collect();
+    merge_adjacent(&mut xs, DIVIDER_MERGE_GAP);
+    merge_adjacent(&mut ys, DIVIDER_MERGE_GAP);
+    (xs, ys)
 }
 
 #[cfg(test)]
@@ -882,5 +1465,186 @@ mod tests {
         let w = 10u32;
         let gray: Vec<u8> = (0..w * 10).map(|i| if i % 2 == 0 { 0 } else { 255 }).collect();
         assert!(std_dev(&gray, w, (0, 0, w as i32, 10)) > MAX_STD_DEV);
+    }
+
+    fn draw_rect_outline(img: &mut image::GrayImage, x: i32, y: i32, w: i32, h: i32, value: u8) {
+        for dx in 0..w {
+            img.put_pixel((x + dx) as u32, y as u32, image::Luma([value]));
+            img.put_pixel((x + dx) as u32, (y + h - 1) as u32, image::Luma([value]));
+        }
+        for dy in 0..h {
+            img.put_pixel(x as u32, (y + dy) as u32, image::Luma([value]));
+            img.put_pixel((x + w - 1) as u32, (y + dy) as u32, image::Luma([value]));
+        }
+    }
+
+    fn close_box((x, y, w, h): (i32, i32, i32, i32), (ex, ey, ew, eh): (i32, i32, i32, i32)) -> bool {
+        (x - ex).abs() <= 6 && (y - ey).abs() <= 6 && (w - ew).abs() <= 12 && (h - eh).abs() <= 12
+    }
+
+    #[test]
+    fn lengths_match_within_tolerance() {
+        assert!(lengths_match(240, 238));
+        assert!(lengths_match(100, 108));
+    }
+
+    #[test]
+    fn lengths_match_rejects_dissimilar_lengths() {
+        assert!(!lengths_match(240, 180));
+        assert!(!lengths_match(0, 50));
+    }
+
+    #[test]
+    fn merge_segments_unions_overlapping_same_line_detections() {
+        // Two seeds independently discovering slightly different, overlapping stretches of
+        // the same real vertical divider at x=100/x=101 (a 1px line commonly registers on
+        // both sides of its own step -- see `is_edge_pixel`'s doc comment) should collapse
+        // into one segment spanning their union.
+        let segments = vec![
+            Segment { orientation: Orientation::Vertical, fixed: 100, start: 10, end: 150 },
+            Segment { orientation: Orientation::Vertical, fixed: 101, start: 120, end: 300 },
+        ];
+        let merged = merge_segments(segments);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].start, 10);
+        assert_eq!(merged[0].end, 300);
+    }
+
+    #[test]
+    fn detect_regions_by_growth_finds_a_clean_rectangle_outline() {
+        let mut img = image::GrayImage::new(400, 400);
+        draw_rect_outline(&mut img, 80, 80, 240, 240, 255);
+        let boxes = detect_regions_by_growth(img.as_raw(), img.width(), img.height(), (0, 0, 400, 400));
+        assert!(
+            boxes.iter().any(|&b| close_box(b, (80, 80, 240, 240))),
+            "expected to find the drawn rectangle, got {boxes:?}"
+        );
+    }
+
+    #[test]
+    fn detect_regions_by_growth_ignores_lines_with_no_length_partner() {
+        // A vertical line and a horizontal line of two totally different, non-matching
+        // lengths -- neither has a same-orientation partner to pair with, and even if they
+        // did, their span/position don't line up as one rectangle's 4 sides. No box should
+        // be reported.
+        let mut img = image::GrayImage::new(400, 400);
+        for y in 50..90 {
+            img.put_pixel(120, y, image::Luma([255]));
+        }
+        for x in 200..340 {
+            img.put_pixel(x, 250, image::Luma([255]));
+        }
+        let boxes = detect_regions_by_growth(img.as_raw(), img.width(), img.height(), (0, 0, 400, 400));
+        assert!(boxes.is_empty(), "expected no boxes from two unrelated, unmatched lines, got {boxes:?}");
+    }
+
+    #[test]
+    fn full_scan_lines_finds_a_solid_vertical_divider() {
+        let mut img = image::GrayImage::new(400, 300);
+        for y in 0..300 {
+            img.put_pixel(200, y, image::Luma([255]));
+        }
+        let (xs, ys) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 400, 300));
+        assert!(xs.contains(&200) || xs.iter().any(|&x| (x - 200).abs() <= DIVIDER_MERGE_GAP), "expected x~200, got {xs:?}");
+        assert!(ys.is_empty(), "a clean vertical line shouldn't also register as a horizontal one, got {ys:?}");
+    }
+
+    #[test]
+    fn full_scan_lines_finds_a_solid_horizontal_divider() {
+        let mut img = image::GrayImage::new(300, 400);
+        for x in 0..300 {
+            img.put_pixel(x, 150, image::Luma([255]));
+        }
+        let (xs, ys) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 300, 400));
+        assert!(xs.is_empty(), "a clean horizontal line shouldn't also register as a vertical one, got {xs:?}");
+        assert!(ys.contains(&150) || ys.iter().any(|&y| (y - 150).abs() <= DIVIDER_MERGE_GAP), "expected y~150, got {ys:?}");
+    }
+
+    #[test]
+    fn full_scan_lines_ignores_a_short_incidental_line() {
+        // A vertical line covering only the top 20% of the window -- far short of the 50%
+        // agreement `FULL_SCAN_MATCH_FRACTION` requires -- shouldn't register at all.
+        let mut img = image::GrayImage::new(400, 300);
+        for y in 0..60 {
+            img.put_pixel(200, y, image::Luma([255]));
+        }
+        let (xs, ys) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 400, 300));
+        assert!(xs.is_empty() && ys.is_empty(), "expected no lines from a short 20%-coverage line, got xs={xs:?} ys={ys:?}");
+    }
+
+    #[test]
+    fn full_scan_lines_returns_nothing_on_a_blank_image() {
+        let img = image::GrayImage::new(300, 200);
+        let (xs, ys) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 300, 200));
+        assert!(xs.is_empty() && ys.is_empty());
+    }
+
+    #[test]
+    fn full_scan_lines_with_peak_check_rejects_a_broad_band_but_keeps_a_real_spike() {
+        let mut img = image::GrayImage::new(400, 300);
+        // A wide "broad band" of alternating columns (x=60..180, 120px -- comfortably wider
+        // than DIVIDER_PEAK_OFFSET_MAX*2) -- every column in it registers a vertical edge on
+        // every row, mimicking ordinary text's fairly uniform column-to-column structure
+        // rather than one real divider.
+        for y in 0..300 {
+            for x in 60..180 {
+                if x % 2 == 0 {
+                    img.put_pixel(x, y, image::Luma([255]));
+                }
+            }
+        }
+        // One genuinely isolated solid vertical line, far from anything else.
+        for y in 0..300 {
+            img.put_pixel(300, y, image::Luma([255]));
+        }
+
+        let (naive_xs, _) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 400, 300));
+        let (peaked_xs, _) = full_scan_lines_with_peak_check(img.as_raw(), img.width(), img.height(), (0, 0, 400, 300));
+
+        assert!(
+            naive_xs.contains(&120),
+            "the plain density threshold should treat an interior band column as a divider too, got {naive_xs:?}"
+        );
+        assert!(
+            !peaked_xs.contains(&120),
+            "the peak-ratio check should reject an interior band column surrounded by similarly-dense neighbors, got {peaked_xs:?}"
+        );
+        assert!(
+            peaked_xs.iter().any(|&x| (x - 300).abs() <= DIVIDER_MERGE_GAP),
+            "the isolated real divider should still survive the peak check, got {peaked_xs:?}"
+        );
+    }
+
+    #[test]
+    fn full_scan_lines_with_uniformity_check_rejects_a_variable_magnitude_line_but_keeps_a_uniform_one() {
+        let mut img = image::GrayImage::new(300, 300);
+        // A "real divider": the same intensity step every row (background 0, line always
+        // 200) -- perfectly uniform edge magnitude.
+        for y in 0..300 {
+            img.put_pixel(100, y, image::Luma([200]));
+        }
+        // A "text-like" line: same density (an edge every row, so the same as a real
+        // divider under `full_scan_lines` alone) but the step size alternates wildly row to
+        // row, simulating different glyph strokes crossing this column.
+        for y in 0..300 {
+            let v: u8 = if y % 2 == 0 { 210 } else { 10 };
+            img.put_pixel(200, y, image::Luma([v]));
+        }
+
+        let (naive_xs, _) = full_scan_lines(img.as_raw(), img.width(), img.height(), (0, 0, 300, 300));
+        let (uniform_xs, _) = full_scan_lines_with_uniformity_check(img.as_raw(), img.width(), img.height(), (0, 0, 300, 300));
+
+        assert!(
+            naive_xs.contains(&100) && naive_xs.contains(&200),
+            "the plain density threshold should treat both equally-dense lines as dividers, got {naive_xs:?}"
+        );
+        assert!(
+            uniform_xs.iter().any(|&x| (x - 100).abs() <= DIVIDER_MERGE_GAP),
+            "the uniform-magnitude line should survive the uniformity check, got {uniform_xs:?}"
+        );
+        assert!(
+            !uniform_xs.iter().any(|&x| (x - 200).abs() <= DIVIDER_MERGE_GAP),
+            "the wildly-variable-magnitude line should be rejected by the uniformity check, got {uniform_xs:?}"
+        );
     }
 }

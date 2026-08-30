@@ -1,5 +1,5 @@
-//! Unix-socket IPC between the short-lived `omg-keys toggle` CLI (invoked by Hyprland's
-//! `bindr` on Right Shift / Super) and the long-running `omg-keysd` daemon that owns the
+//! Unix-socket IPC between the short-lived `omakeys toggle` CLI (invoked by Hyprland's
+//! `bindr` on Right Shift / Super) and the long-running `omakeysd` daemon that owns the
 //! overlay. The daemon's listener runs on a plain blocking thread and hands decoded
 //! commands to the GTK/glib main loop over an `async-channel`.
 
@@ -23,14 +23,14 @@ pub enum Command {
 
 pub fn socket_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(runtime_dir).join("omg-keys.sock")
+    PathBuf::from(runtime_dir).join("omakeys.sock")
 }
 
 /// Send a single command to a running daemon. Returns an error if no daemon is listening.
 pub fn send_command(cmd: Command) -> Result<()> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("connecting to omg-keysd socket at {}", path.display()))?;
+        .with_context(|| format!("connecting to omakeysd socket at {}", path.display()))?;
     let payload = serde_json::to_vec(&cmd)?;
     stream.write_all(&payload)?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -44,7 +44,7 @@ pub fn bind() -> Result<UnixListener> {
         let _ = std::fs::remove_file(&path);
     }
     let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding omg-keysd socket at {}", path.display()))?;
+        .with_context(|| format!("binding omakeysd socket at {}", path.display()))?;
     Ok(listener)
 }
 
@@ -60,7 +60,7 @@ pub fn spawn_listener_thread(listener: UnixListener, sender: async_channel::Send
                 continue;
             }
             let Ok(cmd) = serde_json::from_slice::<Command>(&buf) else {
-                log::warn!("omg-keysd: ignoring malformed IPC message");
+                log::warn!("omakeysd: ignoring malformed IPC message");
                 continue;
             };
             if sender.send_blocking(cmd).is_err() {

@@ -29,7 +29,7 @@ impl Default for Settings {
 }
 
 fn config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "omg-keys")
+    directories::ProjectDirs::from("", "", "omakeys")
         .map(|dirs| dirs.config_dir().join("config.json"))
 }
 
@@ -38,17 +38,17 @@ fn config_path() -> Option<PathBuf> {
 /// a broken settings file shouldn't stop the daemon from starting.
 pub fn load() -> Settings {
     let Some(path) = config_path() else {
-        log::warn!("omg-keys: could not determine config directory, using default settings");
+        log::warn!("omakeys: could not determine config directory, using default settings");
         return Settings::default();
     };
     match std::fs::read_to_string(&path) {
         Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|e| {
-            log::warn!("omg-keys: config at {} failed to parse ({e}), using defaults", path.display());
+            log::warn!("omakeys: config at {} failed to parse ({e}), using defaults", path.display());
             Settings::default()
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
         Err(e) => {
-            log::warn!("omg-keys: could not read config at {} ({e}), using defaults", path.display());
+            log::warn!("omakeys: could not read config at {} ({e}), using defaults", path.display());
             Settings::default()
         }
     }

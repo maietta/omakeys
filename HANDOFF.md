@@ -1,4 +1,7 @@
-# omg-keys — handoff notes
+# OmaKeys — handoff notes
+
+(Project directory is still `omg-keys` on disk; the crate/binary and everything else were
+renamed to OmaKeys/omakeys.)
 
 ## Goal
 
@@ -29,10 +32,10 @@ A keyboard-driven mouse replacement for Hyprland/wlroots (Wayland), written in R
 
 ## Architecture
 
-- `omg-keysd` (daemon, `omg-keys daemon`): owns the GTK4 + `gtk4-layer-shell` overlay
+- `omakeysd` (daemon, `omakeys daemon`): owns the GTK4 + `gtk4-layer-shell` overlay
   window, runs the `gtk4::Application` main loop on the main thread. Should be started
   once per session (wired into `~/.config/hypr/autostart.lua`).
-- `omg-keys toggle` / `omg-keys hints` / `omg-keys quit`: thin CLI clients that connect to
+- `omakeys toggle` / `omakeys hints` / `omakeys quit`: thin CLI clients that connect to
   a Unix socket and send one `ipc::Command` to the running daemon, then exit. These are
   what Hyprland keybinds `exec`.
 - IPC: plain blocking `std::os::unix::net::UnixListener` on a background thread
@@ -113,12 +116,12 @@ A keyboard-driven mouse replacement for Hyprland/wlroots (Wayland), written in R
 
 ## Hyprland integration (already applied to this machine)
 
-- `~/.config/hypr/autostart.lua`: `o.launch_on_start("<repo>/target/release/omg-keys daemon")`
+- `~/.config/hypr/autostart.lua`: `o.launch_on_start("<repo>/target/release/omakeys daemon")`
 - `~/.config/hypr/bindings.lua`:
   ```lua
-  o.bind("SHIFT + SHIFT_R", "Toggle omg-keys grid", "<repo>/target/release/omg-keys toggle", { release = true })
-  o.bind("SUPER + SUPER_L", "Toggle omg-keys grid", "<repo>/target/release/omg-keys toggle", { release = true })
-  o.bind("CTRL + Control_R", "Toggle omg-keys hints", "<repo>/target/release/omg-keys hints", { release = true })
+  o.bind("SHIFT + SHIFT_R", "Toggle omakeys grid", "<repo>/target/release/omakeys toggle", { release = true })
+  o.bind("SUPER + SUPER_L", "Toggle omakeys grid", "<repo>/target/release/omakeys toggle", { release = true })
+  o.bind("CTRL + Control_R", "Toggle omakeys hints", "<repo>/target/release/omakeys hints", { release = true })
   ```
   (Omarchy's Hyprland config is Lua now, not the old `hyprland.conf` text format — see
   `hyprctl repl`/`hl.bind` docs at https://wiki.hypr.land/Configuring/Basics/Binds/. Note:
@@ -126,7 +129,7 @@ A keyboard-driven mouse replacement for Hyprland/wlroots (Wayland), written in R
   `SUPER_L` which happen to already be correct XKB names.)
 - Config validated with `hyprctl reload` + `hyprctl configerrors` (clean).
 - Daemon binary is currently started manually for testing
-  (`/home/t14/Projects/omg-keys/target/release/omg-keys daemon &`); it will also
+  (`/home/t14/Projects/omg-keys/target/release/omakeys daemon &`); it will also
   autostart on next full Hyprland session start via the config above.
 
 ## What's done and verified working (live-tested on this machine via grim screenshots)
@@ -135,7 +138,7 @@ A keyboard-driven mouse replacement for Hyprland/wlroots (Wayland), written in R
   keyboard-shape-to-screen-position mapping confirmed both by unit test and visually.
 - Mouse warps to the selected cell via the virtual pointer.
 - Overlay is translucent while picking, fully invisible once a cell is selected.
-- AT-SPI hint scan (`omg-keys hints`) is now verified end-to-end via screenshot: it finds
+- AT-SPI hint scan (`omakeys hints`) is now verified end-to-end via screenshot: it finds
   every window on the focused monitor's active workspace (not just the focused one), matches
   each to its AT-SPI application frame by title, and draws boxes at the *correct* on-screen
   position for apps whose toolkit actually reports real element positions (confirmed with
@@ -643,11 +646,11 @@ bigger, separate system change.
 ```bash
 cd /home/t14/Projects/omg-keys
 cargo build --release
-pkill -f "omg-keys daemon"; rm -f /run/user/1000/omg-keys.sock
-RUST_LOG=info ./target/release/omg-keys daemon &   # or just wait for autostart next login
-./target/release/omg-keys toggle    # opens/closes the grid (same as tapping R-Shift/Super)
-./target/release/omg-keys hints     # opens/closes AT-SPI hint boxes
-tail -f /tmp/omg-keysd.log          # if redirected there during manual runs
+pkill -f "omakeys daemon"; rm -f /run/user/1000/omakeys.sock
+RUST_LOG=info ./target/release/omakeys daemon &   # or just wait for autostart next login
+./target/release/omakeys toggle    # opens/closes the grid (same as tapping R-Shift/Super)
+./target/release/omakeys hints     # opens/closes AT-SPI hint boxes
+tail -f /tmp/omakeysd.log          # if redirected there during manual runs
 ```
 
 Take screenshots with `grim -o <output-name> /tmp/x.png` (`hyprctl -j monitors` for

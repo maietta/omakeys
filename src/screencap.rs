@@ -153,7 +153,7 @@ pub fn capture_output_gray(output_name: &str) -> Result<Capture> {
     }
 
     let size = (stride * height) as usize;
-    let fd = memfd_create("omg-keys-screencap", MemfdFlags::CLOEXEC)?;
+    let fd = memfd_create("omakeys-screencap", MemfdFlags::CLOEXEC)?;
     ftruncate(&fd, size as u64)?;
     let file = std::fs::File::from(fd);
     let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };

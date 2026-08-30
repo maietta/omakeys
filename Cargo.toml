@@ -1,5 +1,5 @@
 [package]
-name = "omg-keys"
+name = "omakeys"
 version = "0.1.0"
 edition = "2024"
 description = "Keyboard-driven mouse replacement: grid overlay + AT-SPI button/text-field hints, for Hyprland/wlroots."
@@ -34,7 +34,7 @@ async-channel = "2"
 # detection, for apps AT-SPI can't see into (GTK4 position bug, Electron without a11y).
 rustix = { version = "1", features = ["fs"] }
 memmap2 = "0.9"
-image = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["gif"] }
 imageproc = "0.27"
 
 # IPC + misc
